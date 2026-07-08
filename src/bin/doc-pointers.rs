@@ -353,6 +353,9 @@ fn collect_pointers(
 
 fn parse_declaration(line: &str) -> Option<(String, String, String)> {
     let start = line.find('⟦')?;
+    if !declaration_context_allows(line, start) {
+        return None;
+    }
     let after_start = start + '⟦'.len_utf8();
     let end_offset = line[after_start..].find('⟧')?;
     let end = after_start + end_offset;
@@ -367,6 +370,33 @@ fn parse_declaration(line: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((code.to_string(), name, clean_comment_tail(description)))
+}
+
+fn declaration_context_allows(line: &str, start: usize) -> bool {
+    let prefix = &line[..start];
+    let before = prefix.trim_end();
+    if before.is_empty() {
+        return true;
+    }
+
+    let trimmed = before.trim_start();
+    let leading_comment_markers = ["//", "#", "<!--", "/*", "*", "--", ";"];
+    if leading_comment_markers
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+    {
+        return true;
+    }
+
+    let inline_comment_markers = ["//", "/*", "<!--", " #", "\t#", " --"];
+    if inline_comment_markers
+        .iter()
+        .any(|marker| trimmed.contains(marker))
+    {
+        return true;
+    }
+
+    false
 }
 
 fn clean_comment_tail(value: &str) -> String {
@@ -386,14 +416,25 @@ fn valid_code(code: &str) -> bool {
 fn scan_files(root: &Path, db_path: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     let skip_dirs: HashSet<&str> = [
+        ".DS_Store",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".fseventsd",
         ".git",
+        ".idea",
         ".vscode",
         "Builds",
+        "DerivedData",
         "Library",
         "Logs",
         "Temp",
         "UserSettings",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
         "obj",
+        "target",
     ]
     .into_iter()
     .collect();
@@ -666,7 +707,7 @@ fn unicode4_encode_uuid(value: Uuid) -> String {
     for _ in 0..TOKEN_LENGTH {
         let index = (number % TOKEN_SIZE) as u32;
         number /= TOKEN_SIZE;
-        chars.push(char::from_u32(TOKEN_START + index).expect("valid CJK code point"));
+        chars.push(char::from_u32(TOKEN_START + index).expect("valid token code point"));
     }
     chars.into_iter().rev().collect()
 }
@@ -748,5 +789,114 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
         env::current_dir()
             .map_err(|error| error.to_string())
             .map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_declaration_accepts_bare_and_comment_lines() {
+        assert_eq!(
+            parse_declaration("⟦DPTR⟧ Documentation pointer convention :: Defines hard pointers."),
+            Some((
+                "DPTR".to_string(),
+                "Documentation pointer convention".to_string(),
+                "Defines hard pointers.".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declaration("// ⟦ABCD⟧ Pointer routing :: Centralizes pointer input."),
+            Some((
+                "ABCD".to_string(),
+                "Pointer routing".to_string(),
+                "Centralizes pointer input.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_declaration_ignores_quoted_prompt_examples() {
+        let line = "            \"\\\"⟦𓅕𓀦𓈽𓆡⟧ Name :: uuid5:01234567-89ab-cdef-0123-456789abcdef\\\", remove that line\"";
+        assert_eq!(parse_declaration(line), None);
+    }
+
+    #[test]
+    fn parse_declaration_ignores_non_comment_code_prefixes() {
+        assert_eq!(
+            parse_declaration("let marker = \"⟦ABCD⟧ Name :: Description\";"),
+            None
+        );
+        assert_eq!(
+            parse_declaration("value * \"⟦ABCD⟧ Name :: Description\""),
+            None
+        );
+    }
+
+    #[test]
+    fn generated_token_matches_unity_fixture() {
+        let uuid = Uuid::new_v5(
+            &DOC_POINTER_NAMESPACE,
+            "doc-pointers:TestPointer".as_bytes(),
+        );
+        assert_eq!(uuid.to_string(), "5c692577-ad0c-51f1-992c-759b5e5fffb5");
+        assert_eq!(unicode4_encode_uuid(uuid), "𓆴𓎲𓋝𓁅");
+    }
+
+    #[test]
+    fn collect_pointers_skips_spotlight_cache() {
+        let root = env::temp_dir().join(format!("doc-pointers-test-{}", Uuid::new_v4()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".Spotlight-V100/cache")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join(".Spotlight-V100/cache/noise.txt"),
+            "⟦NOIS⟧ Noise :: Should be ignored.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/real.md"),
+            "<!-- ⟦REAL⟧ Real pointer :: Should be indexed. -->\n",
+        )
+        .unwrap();
+
+        let (pointers, errors) =
+            collect_pointers(&root, &root.join("docs/doc-pointer-db.json")).unwrap();
+        assert!(errors.is_empty());
+        assert!(pointers.contains_key("REAL"));
+        assert!(!pointers.contains_key("NOIS"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expand_markdown_links_rewrites_deeplink_targets() {
+        let root = env::temp_dir().join(format!("doc-pointers-test-{}", Uuid::new_v4()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/target.md"),
+            "<!-- ⟦ABCD⟧ Target pointer :: Used by markdown expansion. -->\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/ref.md"),
+            "[target](deeplink:⟦ABCD⟧)\n\n```markdown\n[ignored](deeplink:ABCD)\n```\n",
+        )
+        .unwrap();
+
+        let (pointers, errors) =
+            collect_pointers(&root, &root.join("docs/doc-pointer-db.json")).unwrap();
+        assert!(errors.is_empty());
+        let (changed, link_errors) = expand_markdown_links(&root, &pointers, true).unwrap();
+        assert!(link_errors.is_empty());
+        assert_eq!(changed, vec!["docs/ref.md".to_string()]);
+
+        let rewritten = fs::read_to_string(root.join("docs/ref.md")).unwrap();
+        assert!(rewritten.contains("[target](docs/target.md:1?code=⟦ABCD⟧)"));
+        assert!(rewritten.contains("[ignored](deeplink:ABCD)"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
