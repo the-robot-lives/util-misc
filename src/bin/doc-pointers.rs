@@ -54,12 +54,38 @@ enum PointerFormat {
 }
 
 fn main() {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    let result = if matches!(args.first().map(String::as_str), Some("uuid5" | "new")) {
-        args.remove(0);
-        uuid5_command(&args)
-    } else {
-        scan_command(&args)
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // No arguments at all -> print help and exit 0. Previously this silently ran a
+    // read-only scan, which surprised users who just wanted to know what the tool does.
+    if args.is_empty() {
+        print_help();
+        std::process::exit(0);
+    }
+
+    // First positional token selects the subcommand (build / uuid5 / hook / help).
+    // A leading option (-h/--help, or a legacy build flag like --root/--write/--check)
+    // is treated as the build command so existing scripts keep working.
+    let result = match args.first().map(String::as_str) {
+        Some("build") => scan_command(&args[1..]),
+        Some("uuid5" | "new") => uuid5_command(&args[1..]),
+        Some("hook") => install_command(&args[1..], true),
+        Some("-h" | "--help" | "help") => {
+            print_help();
+            return;
+        }
+        Some("--root" | "--db" | "--write" | "--check" | "--install-hook") => {
+            scan_or_install(&args)
+        }
+        Some(value) => {
+            eprintln!("ERROR: unknown subcommand or option: {value}\n");
+            print_help();
+            std::process::exit(1);
+        }
+        None => {
+            print_help();
+            return;
+        }
     };
 
     if let Err(error) = result {
@@ -68,14 +94,32 @@ fn main() {
     }
 }
 
+// Legacy dispatch: the build/install-hook commands used to share one option namespace at the
+// top level. `--install-hook` installs the pre-commit hook; everything else is a build scan.
+fn scan_or_install(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--install-hook") {
+        install_command(args, false)
+    } else {
+        scan_command(args)
+    }
+}
+
+fn install_command(args: &[String], explicit: bool) -> Result<(), String> {
+    let options = parse_scan_options(args)?;
+    // `explicit` = reached via the `hook` subcommand (always install). The legacy
+    // `--install-hook` flag also sets options.install_hook; reject ambiguous calls.
+    if !explicit && !options.install_hook {
+        eprintln!("ERROR: --install-hook requires the hook subcommand or the --install-hook flag");
+        std::process::exit(1);
+    }
+    let root = absolute_path(&options.root)?;
+    install_hook(&root)
+}
+
 fn scan_command(args: &[String]) -> Result<(), String> {
     let options = parse_scan_options(args)?;
     let root = absolute_path(&options.root)?;
     let db_path = absolute_path(&root.join(&options.db))?;
-
-    if options.install_hook {
-        return install_hook(&root);
-    }
 
     let (pointers, mut errors) = collect_pointers(&root, &db_path)?;
     let (changed_links, link_errors) = expand_markdown_links(&root, &pointers, options.write)?;
@@ -292,19 +336,85 @@ fn expect_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a 
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn print_help() {
+    println!(
+        "\
+doc-pointers — durable, code-stable cross-document pointers
+
+WHAT
+  Doc pointers are 4-character tokens (drawn from the Unicode U+13000..U+1342F
+  Egyptian Hieroglyphs block) placed as inline declarations inside source files,
+  comments, and Markdown. A declaration looks like:
+
+      ⟦𓆴𓎲𓋝𓁅⟧ Pointer name :: Human readable description.
+
+  Because the token is a fixed Unicode glyph sequence and not a path or line
+  number, it survives renames, refactors, and file moves. Other documents then
+  reference it with a `deeplink:` Markdown link, e.g.
+
+      [see routing](deeplink:⟦𓆴𓎲𓋝𓁅⟧)
+
+  and `doc-pointers` rewrites that link into a concrete `path:line?code=⟦…⟧` target.
+
+HOW
+  1. Place a ⟦token⟧ Name :: Description declaration at the anchor you want to
+     point at (a function, a heading, a config stanza). The token must live in a
+     comment context (//, #, <!--, /*, *, --, ;) or on its own line, so it never
+     collides with string literals or code.
+  2. Generate new tokens with `doc-pointers uuid5` (deterministic UUIDv5,
+     collision-checked against the existing database, copied to your clipboard).
+  3. Reference any token from Markdown with `[label](deeplink:⟦token⟧)`.
+  4. Run `doc-pointers build` to (a) collect every declaration in the repo into
+     `docs/doc-pointer-db.json` and (b) expand every `deeplink:` reference into a
+     real `file:line` target. Run `doc-pointers build --check` in CI / a
+     pre-commit hook to fail when the database or any link is stale.
+
+WHY
+  Ordinary file:line and URL links rot the instant code moves. Branch names and
+  permalinks are worse. A doc pointer decouples the *identity* of an anchor
+  (the token) from its *current location* (which `build` resolves on demand), so
+  docs stay accurate without manual re-pointing. The Hieroglyph block is chosen
+  so tokens are visually distinct and never appear in real source, and the
+  UUIDv5 derivation makes them reproducible and collision-free across machines.
+
+USAGE
+  doc-pointers                       print this help
+  doc-pointers build                 collect declarations + expand deeplinks (read-only)
+  doc-pointers build --write         also write docs/doc-pointer-db.json + expanded links
+  doc-pointers build --check         fail (exit 1) if a write would change anything
+  doc-pointers hook                  install a pre-commit hook that runs --check
+  doc-pointers uuid5 [NAME]          mint a new 4-glyph token, copied to clipboard
+  doc-pointers help                  print this help
+
+SUB-COMMAND HELP
+  doc-pointers build --help          options for the build/scan command
+  doc-pointers uuid5 --help          options for the uuid5 command
+
+LEGACY
+  The bare flags still work for existing scripts:
+    doc-pointers --write        ==  doc-pointers build --write
+    doc-pointers --check        ==  doc-pointers build --check
+    doc-pointers --install-hook ==  doc-pointers hook
+  Prefer the subcommand form in new code."
+    );
+}
+
 fn print_scan_help() {
     println!(
-        "usage: doc-pointers [--root ROOT] [--db DB] [--write] [--check] [--install-hook]\n\n\
-Build the doc pointer database and expand deeplink: markdown links.\n\n\
-options:\n  --root ROOT       repository root, default: current directory\n  --db DB           pointer database path\n  --write           write database and expand markdown deeplinks\n  --check           fail if writes would be needed\n  --install-hook    install a local pre-commit check hook\n\n\
-commands:\n  uuid5 [NAME]      generate a UUIDv5-backed four-character marker and copy it"
+        "usage: doc-pointers build [--root ROOT] [--db DB] [--write] [--check]\n\n\
+Build the doc pointer database and expand deeplink: markdown links.\n\
+Run without --write/--check, this is a dry run: it reports how many\n\
+declarations it found and any errors, but changes nothing.\n\n\
+options:\n  --root ROOT       repository root, default: current directory\n  --db DB           pointer database path (default docs/doc-pointer-db.json)\n  --write           write database and expand markdown deeplinks\n  --check           fail if writes would be needed (CI / pre-commit)"
     );
 }
 
 fn print_uuid5_help() {
     println!(
         "usage: doc-pointers uuid5 [options] [NAME]\n\n\
-Generate a deterministic UUIDv5-backed four-character doc pointer token.\n\n\
+Generate a deterministic UUIDv5-backed four-character doc pointer token.\n\
+The token is collision-checked against the current database and copied to\n\
+the clipboard unless --no-clipboard is given.\n\n\
 options:\n  --root ROOT             repository root, default: current directory\n  --db DB                 pointer database path\n  --namespace NAMESPACE   doc-pointers, dns, url, oid, x500, or a UUID\n  --salt SALT             optional deterministic salt\n  --format FORMAT         marker, code, declaration, or deeplink\n  --description TEXT      description used by --format declaration\n  --no-clipboard          print without copying to clipboard"
     );
 }
