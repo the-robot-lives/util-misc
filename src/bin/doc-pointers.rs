@@ -949,7 +949,7 @@ WHAT
   Egyptian Hieroglyphs block) placed as inline declarations inside source files,
   comments, and Markdown. A declaration looks like:
 
-      ⟦𓆴𓎲𓋝𓁅⟧ Pointer name :: Human readable description.
+      > ⟦𓆴𓎲𓋝𓁅⟧ Pointer name :: Human readable description.
 
   Because the token is a fixed Unicode glyph sequence and not a path or line
   number, it survives renames, refactors, and file moves. Other documents then
@@ -1091,6 +1091,22 @@ fn parse_declaration(line: &str) -> Option<(String, String, String)> {
 
 fn declaration_context_allows(line: &str, start: usize) -> bool {
     let prefix = &line[..start];
+    // An odd number of unescaped double-quotes before the marker means it sits inside
+    // a string literal (test fixtures, codegen templates) — never a real declaration.
+    // Source files are scanned since the annotate release, so this guard keeps the
+    // tool's own fixtures (and any code embedding marker examples in strings) out of
+    // the DB. Escaped quotes (\") are literal characters, not string delimiters.
+    let mut quotes = 0usize;
+    let mut prev = '\0';
+    for c in prefix.chars() {
+        if c == '"' && prev != '\\' {
+            quotes += 1;
+        }
+        prev = c;
+    }
+    if quotes % 2 == 1 {
+        return false;
+    }
     let before = prefix.trim_end();
     if before.is_empty() {
         return true;
@@ -1562,6 +1578,28 @@ mod tests {
     fn parse_declaration_ignores_quoted_prompt_examples() {
         let line = "            \"\\\"⟦𓅕𓀦𓈽𓆡⟧ Name :: uuid5:01234567-89ab-cdef-0123-456789abcdef\\\", remove that line\"";
         assert_eq!(parse_declaration(line), None);
+    }
+
+    #[test]
+    fn parse_declaration_ignores_markers_inside_string_literals() {
+        // Source files are scanned now; fixture strings like these must never register.
+        assert_eq!(
+            parse_declaration("        parse_declaration(\"// ⟦ABCD⟧ Name :: Desc\"),"),
+            None
+        );
+        assert_eq!(
+            parse_declaration("            \"/// ⟦ABCD⟧ alpha :: existing marker\","),
+            None
+        );
+        assert_eq!(
+            parse_declaration("            \"<!-- ⟦REAL⟧ Real pointer :: fixture -->\\n\","),
+            None
+        );
+        // Balanced quotes before the marker keep real comments working.
+        assert_eq!(
+            parse_declaration("// \"quoted\" ⟦ABCD⟧ Name :: Desc"),
+            Some(("ABCD".to_string(), "Name".to_string(), "Desc".to_string()))
+        );
     }
 
     #[test]
