@@ -58,10 +58,11 @@ your token.
   doc-pointers uuid5 "routing table init" --no-clipboard
   ```
   and copy the `clipboard:` line it prints manually.
-- **Only specific file extensions are scanned**: `asmdef, cs, css, html, json, md, meta,
-  shader, txt, uxml, yaml, yml`. A declaration inside a `.rs`, `.sh`, `.js`, or `.py` file
-  is silently invisible to `build` — put declarations in adjacent `.md`/`.yaml` docs, or
-  don't expect source-code anchors to register.
+- **Only specific file extensions are scanned**: `asmdef, cs, css, ex, exs, html, js,
+  json, md, meta, mjs, rs, shader, ts, tsx, txt, uxml, yaml, yml`. A declaration inside a
+  `.sh` or `.py` file is still silently invisible to `build` — put those declarations in
+  adjacent `.md`/`.yaml` docs. (`.rs`/`.ex`/`.js`/`.ts` source anchors register as of the
+  `annotate` release; see `doc-pointers-annotate.md` for mass-annotating public functions.)
 - `build` is **read-only by default**. Without `--write` it only reports how many
   declarations it found and any duplicate-token errors — nothing is written until you add
   `--write`.

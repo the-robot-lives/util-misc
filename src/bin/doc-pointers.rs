@@ -31,6 +31,49 @@ struct ScanOptions {
     write: bool,
     check: bool,
     install_hook: bool,
+    filter: ScanFilter,
+}
+
+/// Root-relative subtree scoping for scans. Empty `include` means the whole root.
+/// A directory is entered when it could contain an included path; a file matches
+/// when it sits under an included prefix and under no excluded prefix.
+#[derive(Debug, Default, Clone)]
+struct ScanFilter {
+    include: Vec<PathBuf>,
+    exclude: Vec<PathBuf>,
+}
+
+impl ScanFilter {
+    fn allows_dir(&self, rel: &Path) -> bool {
+        if self.exclude.iter().any(|e| rel.starts_with(e)) {
+            return false;
+        }
+        if self.include.is_empty() {
+            return true;
+        }
+        self.include
+            .iter()
+            .any(|i| rel.starts_with(i) || i.starts_with(rel))
+    }
+
+    fn allows_file(&self, rel: &Path) -> bool {
+        if self.exclude.iter().any(|e| rel.starts_with(e)) {
+            return false;
+        }
+        if self.include.is_empty() {
+            return true;
+        }
+        self.include.iter().any(|i| rel.starts_with(i))
+    }
+}
+
+#[derive(Debug)]
+struct AnnotateOptions {
+    root: PathBuf,
+    db: String,
+    write: bool,
+    include_exs: bool,
+    filter: ScanFilter,
 }
 
 #[derive(Debug)]
@@ -68,6 +111,7 @@ fn main() {
     // is treated as the build command so existing scripts keep working.
     let result = match args.first().map(String::as_str) {
         Some("build") => scan_command(&args[1..]),
+        Some("annotate") => annotate_command(&args[1..]),
         Some("uuid5" | "new") => uuid5_command(&args[1..]),
         Some("hook") => install_command(&args[1..], true),
         Some("-h" | "--help" | "help") => {
@@ -121,8 +165,9 @@ fn scan_command(args: &[String]) -> Result<(), String> {
     let root = absolute_path(&options.root)?;
     let db_path = absolute_path(&root.join(&options.db))?;
 
-    let (pointers, mut errors) = collect_pointers(&root, &db_path)?;
-    let (changed_links, link_errors) = expand_markdown_links(&root, &pointers, options.write)?;
+    let (pointers, mut errors) = collect_pointers(&root, &db_path, &options.filter)?;
+    let (changed_links, link_errors) =
+        expand_markdown_links(&root, &pointers, options.write, &options.filter)?;
     errors.extend(link_errors);
 
     let mut db_changed = false;
@@ -188,7 +233,7 @@ fn uuid5_command(args: &[String]) -> Result<(), String> {
     let root = absolute_path(&options.root)?;
     let db_path = absolute_path(&root.join(&options.db))?;
     let namespace = parse_namespace(&options.namespace)?;
-    let (pointers, errors) = collect_pointers(&root, &db_path)?;
+    let (pointers, errors) = collect_pointers(&root, &db_path, &ScanFilter::default())?;
 
     for error in errors {
         eprintln!("WARNING: {error}");
@@ -224,6 +269,549 @@ fn uuid5_command(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Languages the annotate command can target. Detection is deliberately line-anchored
+/// string matching (no AST, no regex dep) — declarations are matched only at the start
+/// of a line after indentation, which excludes almost all string-literal false positives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Rust,
+    Elixir,
+    Js,
+}
+
+fn comment_leader(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Elixir => "#",
+        _ => "//",
+    }
+}
+
+fn language_for_path(path: &Path, include_exs: bool) -> Option<Lang> {
+    match path.extension().and_then(OsStr::to_str)? {
+        "rs" => Some(Lang::Rust),
+        "ex" => Some(Lang::Elixir),
+        // .exs is scripts/migrations — opt-in only (`--lang exs`).
+        "exs" if include_exs => Some(Lang::Elixir),
+        "js" | "ts" | "mjs" | "tsx" => Some(Lang::Js),
+        _ => None,
+    }
+}
+
+fn detect_public_decl(lang: Lang, trimmed: &str) -> Option<String> {
+    match lang {
+        Lang::Rust => detect_rust_pub_fn(trimmed),
+        Lang::Elixir => detect_elixir_public_def(trimmed),
+        Lang::Js => detect_js_export(trimmed),
+    }
+}
+
+fn ident(source: &str) -> Option<String> {
+    let mut name = String::new();
+    for c in source.chars() {
+        if c == '_' || c == '$' || c.is_ascii_alphanumeric() {
+            name.push(c);
+        } else {
+            break;
+        }
+    }
+    let first = name.chars().next()?;
+    if first.is_ascii_digit() {
+        return None;
+    }
+    Some(name)
+}
+
+fn detect_rust_pub_fn(trimmed: &str) -> Option<String> {
+    // Plain `pub` only — `pub(crate)`/`pub(super)` are internal API by declaration
+    // and are deliberately not annotated ("pub = annotated" keeps the rule crisp).
+    let mut rest = trimmed.strip_prefix("pub ")?.trim_start();
+    loop {
+        if let Some(next) = rest.strip_prefix("async ") {
+            rest = next.trim_start();
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("unsafe ") {
+            rest = next.trim_start();
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("const ") {
+            rest = next.trim_start();
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("extern ") {
+            let next = next.trim_start();
+            let after_quote = next.strip_prefix('"')?;
+            let close = after_quote.find('"')?;
+            rest = after_quote[close + 1..].trim_start();
+            continue;
+        }
+        break;
+    }
+    ident(rest.strip_prefix("fn ")?.trim_start())
+}
+
+fn detect_elixir_public_def(trimmed: &str) -> Option<String> {
+    // Exact `def ` / `defmacro ` keyword + space, so defp/defmodule/defmacrop/
+    // defdelegate/defimpl never match.
+    let rest = trimmed
+        .strip_prefix("def ")
+        .or_else(|| trimmed.strip_prefix("defmacro "))?
+        .trim_start();
+    if rest.starts_with("unquote") {
+        return None; // macro-generated head
+    }
+    let mut name = ident(rest)?;
+    let first = name.chars().next()?;
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return None;
+    }
+    if let Some(c) = rest[name.len()..].chars().next() {
+        if c == '?' || c == '!' {
+            name.push(c);
+        }
+    }
+    Some(name)
+}
+
+fn detect_js_export(trimmed: &str) -> Option<String> {
+    if let Some(rest) = trimmed.strip_prefix("export ") {
+        let mut rest = rest.trim_start();
+        if let Some(next) = rest.strip_prefix("default ") {
+            rest = next.trim_start();
+        }
+        let mut fn_rest = rest;
+        if let Some(next) = fn_rest.strip_prefix("async ") {
+            fn_rest = next.trim_start();
+        }
+        if let Some(next) = fn_rest.strip_prefix("function") {
+            let next = next.trim_start_matches('*').trim_start();
+            return ident(next); // anonymous default export -> None
+        }
+        if let Some(next) = rest.strip_prefix("const ") {
+            let next = next.trim_start();
+            let name = ident(next)?;
+            let after = next[name.len()..].trim_start();
+            let eq = find_assignment_eq(after)?;
+            if is_function_shaped(after[eq + 1..].trim_start()) {
+                return Some(name);
+            }
+        }
+        return None;
+    }
+    let rest = trimmed.strip_prefix("module.").unwrap_or(trimmed);
+    let next = rest.strip_prefix("exports.")?;
+    let name = ident(next)?;
+    let after = next[name.len()..].trim_start();
+    if after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>") {
+        return Some(name);
+    }
+    None
+}
+
+/// Find the top-level `=` of an assignment, skipping TS type annotations that may
+/// contain `=>` (e.g. `const f: (x: T) => U = ...`) and comparison operators.
+fn find_assignment_eq(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte != b'=' {
+            continue;
+        }
+        let next = bytes.get(index + 1).copied();
+        let prev = if index > 0 {
+            Some(bytes[index - 1])
+        } else {
+            None
+        };
+        if next == Some(b'>') || next == Some(b'=') {
+            continue;
+        }
+        if matches!(prev, Some(b'!') | Some(b'<') | Some(b'>') | Some(b'=')) {
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn is_function_shaped(rhs: &str) -> bool {
+    let rhs = rhs
+        .strip_prefix("async ")
+        .map(str::trim_start)
+        .unwrap_or(rhs);
+    if rhs.starts_with('(') || rhs.starts_with("function") {
+        return true;
+    }
+    match ident(rhs) {
+        Some(name) => rhs[name.len()..].trim_start().starts_with("=>"),
+        None => false,
+    }
+}
+
+/// True when the contiguous comment/attribute/doc block immediately above the
+/// declaration already contains a `⟦…⟧` marker — makes annotate idempotent and
+/// tolerates humans relocating the marker within the doc block.
+fn block_above_has_marker(lang: Lang, lines: &[&str], decl_idx: usize) -> bool {
+    let mut index = decl_idx;
+    let mut in_heredoc = false;
+    while index > 0 {
+        index -= 1;
+        let line = lines[index];
+        let trimmed = line.trim();
+        if in_heredoc {
+            if line.contains('⟦') {
+                return true;
+            }
+            if trimmed.starts_with('@') && trimmed.contains("\"\"\"") {
+                in_heredoc = false;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        if lang == Lang::Elixir && trimmed == "\"\"\"" {
+            in_heredoc = true;
+            continue;
+        }
+        let is_comment = match lang {
+            Lang::Rust => trimmed.starts_with("//") || trimmed.starts_with("#["),
+            Lang::Elixir => trimmed.starts_with('#') || trimmed.starts_with('@'),
+            Lang::Js => {
+                trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with('@')
+            }
+        };
+        if !is_comment {
+            break;
+        }
+        if line.contains('⟦') {
+            return true;
+        }
+    }
+    false
+}
+
+/// First sentence of the declaration's doc block (Rust `///`, Elixir `@doc`, JSDoc/`//`),
+/// sanitized for the marker grammar. `None` when no usable doc text exists.
+fn derive_description(lang: Lang, lines: &[&str], decl_idx: usize) -> Option<String> {
+    // Locate the start of the contiguous block above.
+    let mut start = decl_idx;
+    let mut index = decl_idx;
+    let mut in_heredoc = false;
+    while index > 0 {
+        index -= 1;
+        let trimmed = lines[index].trim();
+        if in_heredoc {
+            start = index;
+            if trimmed.starts_with('@') && trimmed.contains("\"\"\"") {
+                in_heredoc = false;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        if lang == Lang::Elixir && trimmed == "\"\"\"" {
+            in_heredoc = true;
+            start = index;
+            continue;
+        }
+        let is_comment = match lang {
+            Lang::Rust => trimmed.starts_with("//") || trimmed.starts_with("#["),
+            Lang::Elixir => trimmed.starts_with('#') || trimmed.starts_with('@'),
+            Lang::Js => {
+                trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with('@')
+            }
+        };
+        if !is_comment {
+            break;
+        }
+        start = index;
+    }
+    if start == decl_idx {
+        return None;
+    }
+    // Downward pass: first usable doc-text line.
+    let mut heredoc_doc = false;
+    for line in &lines[start..decl_idx] {
+        let trimmed = line.trim();
+        let text: Option<&str> = match lang {
+            Lang::Rust => trimmed.strip_prefix("///").map(str::trim),
+            Lang::Elixir => {
+                if heredoc_doc {
+                    if trimmed == "\"\"\"" {
+                        heredoc_doc = false;
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("@doc") {
+                    let rest = rest.trim();
+                    if rest.starts_with("\"\"\"") {
+                        heredoc_doc = true;
+                        None
+                    } else {
+                        rest.strip_prefix('"')
+                            .and_then(|r| r.rsplit_once('"'))
+                            .map(|(body, _)| body)
+                    }
+                } else {
+                    None
+                }
+            }
+            Lang::Js => {
+                let stripped = trimmed
+                    .trim_start_matches("/**")
+                    .trim_start_matches("/*")
+                    .trim_start_matches('*')
+                    .trim_start_matches("//")
+                    .trim();
+                let stripped = stripped.trim_end_matches("*/").trim();
+                if stripped.is_empty() {
+                    None
+                } else {
+                    Some(stripped)
+                }
+            }
+        };
+        if let Some(text) = text {
+            let text = text.trim();
+            if text.is_empty() || text.starts_with('⟦') || text.starts_with('@') {
+                continue;
+            }
+            return Some(sanitize_description(text));
+        }
+    }
+    None
+}
+
+/// Keep descriptions marker-grammar-safe: `::` is the name/description separator,
+/// so any embedded `::` is softened; long docs are cut to the first sentence / 100 chars.
+fn sanitize_description(text: &str) -> String {
+    let mut clean = text.replace("::", ":");
+    if let Some(pos) = clean.find(". ") {
+        clean.truncate(pos + 1);
+    }
+    if clean.chars().count() > 100 {
+        clean = clean
+            .chars()
+            .take(100)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+    }
+    clean.trim().to_string()
+}
+
+fn annotate_command(args: &[String]) -> Result<(), String> {
+    let options = parse_annotate_options(args)?;
+    let root = absolute_path(&options.root)?;
+    let db_path = absolute_path(&root.join(&options.db))?;
+
+    // Live collision map: DB entries plus every marker in the scanned tree (sources are
+    // scanned too now, so stray markers not yet indexed are collision-checked as well).
+    let (mut pointers, errors) = collect_pointers(&root, &db_path, &options.filter)?;
+    for error in &errors {
+        eprintln!("WARNING: {error}");
+    }
+
+    let mut planned = 0usize;
+    let mut file_reports: Vec<String> = Vec::new();
+    let mut review_flags: Vec<String> = Vec::new();
+
+    for path in scan_files(&root, &db_path, &options.filter)? {
+        let Some(lang) = language_for_path(&path, options.include_exs) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let relpath = rel_path(&path, &root);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut targets: Vec<(usize, String)> = Vec::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if line.len() > 500 {
+                continue; // minification tripwire
+            }
+            let trimmed = line.trim_start();
+            let Some(name) = detect_public_decl(lang, trimmed) else {
+                if lang == Lang::Js && trimmed.starts_with("module.exports = {") {
+                    review_flags.push(format!(
+                        "{relpath}:{}: object-literal module.exports — annotate members manually",
+                        idx + 1
+                    ));
+                }
+                continue;
+            };
+            if lang == Lang::Elixir && !seen_names.insert(name.clone()) {
+                continue; // later clause / other arity of an already-annotated function
+            }
+            if block_above_has_marker(lang, &lines, idx) {
+                continue;
+            }
+            targets.push((idx, name));
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        if lang == Lang::Rust && text.contains("macro_rules!") {
+            review_flags.push(format!(
+                "{relpath}: contains macro_rules! — review inserted markers manually"
+            ));
+        }
+
+        let mut insertions: Vec<(usize, String)> = Vec::new();
+        for (idx, name) in &targets {
+            let seed = format!("{relpath}::{name}");
+            let (code, _uuid, _uuid_name, _attempt) =
+                generate_uuid5_code(&seed, DOC_POINTER_NAMESPACE, "", &pointers)?;
+            let description = derive_description(lang, &lines, *idx)
+                .unwrap_or_else(|| format!("auto-generated pointer for public function {name}"));
+            let indent: String = lines[*idx]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let leader = comment_leader(lang);
+            insertions.push((
+                *idx,
+                format!("{indent}{leader} ⟦{code}⟧ {name} :: {description}"),
+            ));
+            pointers.insert(
+                code.clone(),
+                Pointer {
+                    code,
+                    path: relpath.clone(),
+                    line: idx + 1, // provisional; the closing build records exact lines
+                    name: name.clone(),
+                    description,
+                },
+            );
+        }
+
+        planned += insertions.len();
+        file_reports.push(format!("{relpath}: {} pointer(s)", insertions.len()));
+
+        if options.write {
+            let mut new_lines: Vec<String> =
+                text.split_inclusive('\n').map(str::to_string).collect();
+            for (idx, marker) in insertions.iter().rev() {
+                new_lines.insert(*idx, format!("{marker}\n"));
+            }
+            fs::write(&path, new_lines.concat())
+                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        }
+    }
+
+    for report in &file_reports {
+        println!("{report}");
+    }
+    for flag in &review_flags {
+        println!("REVIEW: {flag}");
+    }
+
+    if options.write {
+        // Closing build: re-collect (markers shifted lines) and persist DB + deeplinks
+        // in the same invocation so `build --check` is green immediately after.
+        let (fresh, build_errors) = collect_pointers(&root, &db_path, &options.filter)?;
+        for error in &build_errors {
+            eprintln!("WARNING: {error}");
+        }
+        let db_changed = write_db(&root, &db_path, &fresh)?;
+        let (changed_links, link_errors) =
+            expand_markdown_links(&root, &fresh, true, &options.filter)?;
+        for error in &link_errors {
+            eprintln!("ERROR: {error}");
+        }
+        println!(
+            "inserted {planned} pointer(s); db {}{}",
+            if db_changed { "updated" } else { "unchanged" },
+            if changed_links.is_empty() {
+                String::new()
+            } else {
+                format!("; expanded deeplinks in: {}", changed_links.join(", "))
+            }
+        );
+        if !link_errors.is_empty() {
+            std::process::exit(1);
+        }
+    } else {
+        println!("would insert {planned} pointer(s); run with --write to apply");
+    }
+
+    Ok(())
+}
+
+fn parse_annotate_options(args: &[String]) -> Result<AnnotateOptions, String> {
+    let mut options = AnnotateOptions {
+        root: PathBuf::from("."),
+        db: DEFAULT_DB_PATH.to_string(),
+        write: false,
+        include_exs: false,
+        filter: ScanFilter::default(),
+    };
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                print_annotate_help();
+                std::process::exit(0);
+            }
+            "--root" => {
+                index += 1;
+                options.root = PathBuf::from(expect_value(args, index, "--root")?);
+            }
+            "--db" => {
+                index += 1;
+                options.db = expect_value(args, index, "--db")?.to_string();
+            }
+            "--include" => {
+                index += 1;
+                options
+                    .filter
+                    .include
+                    .push(PathBuf::from(expect_value(args, index, "--include")?));
+            }
+            "--exclude" => {
+                index += 1;
+                options
+                    .filter
+                    .exclude
+                    .push(PathBuf::from(expect_value(args, index, "--exclude")?));
+            }
+            "--lang" => {
+                index += 1;
+                match expect_value(args, index, "--lang")? {
+                    "exs" => options.include_exs = true,
+                    value => return Err(format!("unsupported --lang value: {value}")),
+                }
+            }
+            "--write" => options.write = true,
+            value => return Err(format!("unknown option: {value}")),
+        }
+        index += 1;
+    }
+
+    Ok(options)
+}
+
+fn print_annotate_help() {
+    println!(
+        "usage: doc-pointers annotate [--root ROOT] [--db DB] [--include P]... [--exclude P]... [--lang exs] [--write]\n\n\
+Walk the tree and insert `⟦code⟧ Name :: Description` markers above every public/exported\n\
+Rust (`pub fn`), Elixir (`def`/`defmacro`), and JS/TS (`export`/`exports.`) function that\n\
+does not already have one in its doc/comment block. Dry-run by default; --write applies\n\
+the insertions and then records the database + expands deeplinks in the same run.\n\n\
+options:\n  --root ROOT       repository root, default: current directory\n  --db DB           pointer database path (default docs/doc-pointer-db.json)\n  --include P       only scan/annotate under this root-relative prefix (repeatable)\n  --exclude P       skip this root-relative prefix (repeatable)\n  --lang exs        also annotate .exs scripts (skipped by default)\n  --write           apply insertions (otherwise dry-run report only)"
+    );
+}
+
 fn parse_scan_options(args: &[String]) -> Result<ScanOptions, String> {
     let mut options = ScanOptions {
         root: PathBuf::from("."),
@@ -231,6 +819,7 @@ fn parse_scan_options(args: &[String]) -> Result<ScanOptions, String> {
         write: false,
         check: false,
         install_hook: false,
+        filter: ScanFilter::default(),
     };
 
     let mut index = 0;
@@ -247,6 +836,20 @@ fn parse_scan_options(args: &[String]) -> Result<ScanOptions, String> {
             "--db" => {
                 index += 1;
                 options.db = expect_value(args, index, "--db")?.to_string();
+            }
+            "--include" => {
+                index += 1;
+                options
+                    .filter
+                    .include
+                    .push(PathBuf::from(expect_value(args, index, "--include")?));
+            }
+            "--exclude" => {
+                index += 1;
+                options
+                    .filter
+                    .exclude
+                    .push(PathBuf::from(expect_value(args, index, "--exclude")?));
             }
             "--write" => options.write = true,
             "--check" => options.check = true,
@@ -382,12 +985,15 @@ USAGE
   doc-pointers build                 collect declarations + expand deeplinks (read-only)
   doc-pointers build --write         also write docs/doc-pointer-db.json + expanded links
   doc-pointers build --check         fail (exit 1) if a write would change anything
+  doc-pointers annotate              dry-run: report public fns lacking markers
+  doc-pointers annotate --write      insert markers + record db in one pass
   doc-pointers hook                  install a pre-commit hook that runs --check
   doc-pointers uuid5 [NAME]          mint a new 4-glyph token, copied to clipboard
   doc-pointers help                  print this help
 
 SUB-COMMAND HELP
   doc-pointers build --help          options for the build/scan command
+  doc-pointers annotate --help       options for the annotate command
   doc-pointers uuid5 --help          options for the uuid5 command
 
 LEGACY
@@ -422,10 +1028,11 @@ options:\n  --root ROOT             repository root, default: current directory\
 fn collect_pointers(
     root: &Path,
     db_path: &Path,
+    filter: &ScanFilter,
 ) -> Result<(HashMap<String, Pointer>, Vec<String>), String> {
     let mut pointers: HashMap<String, Pointer> = HashMap::new();
     let mut errors = Vec::new();
-    for path in scan_files(root, db_path)? {
+    for path in scan_files(root, db_path, filter)? {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
@@ -523,15 +1130,18 @@ fn valid_code(code: &str) -> bool {
         .all(|ch| !ch.is_whitespace() && !"⟦⟧/?#:%".contains(ch))
 }
 
-fn scan_files(root: &Path, db_path: &Path) -> Result<Vec<PathBuf>, String> {
+fn scan_files(root: &Path, db_path: &Path, filter: &ScanFilter) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     let skip_dirs: HashSet<&str> = [
         ".DS_Store",
         ".Spotlight-V100",
         ".Trashes",
+        ".claude",
+        ".elixir_ls",
         ".fseventsd",
         ".git",
         ".idea",
+        ".next",
         ".vscode",
         "Builds",
         "DerivedData",
@@ -539,8 +1149,10 @@ fn scan_files(root: &Path, db_path: &Path) -> Result<Vec<PathBuf>, String> {
         "Logs",
         "Temp",
         "UserSettings",
+        "_build",
         "build",
         "coverage",
+        "deps",
         "dist",
         "node_modules",
         "obj",
@@ -549,20 +1161,33 @@ fn scan_files(root: &Path, db_path: &Path) -> Result<Vec<PathBuf>, String> {
     .into_iter()
     .collect();
     let suffixes: HashSet<&str> = [
-        "asmdef", "cs", "css", "html", "json", "md", "meta", "shader", "txt", "uxml", "yaml", "yml",
+        "asmdef", "cs", "css", "ex", "exs", "html", "js", "json", "md", "meta", "mjs", "rs",
+        "shader", "ts", "tsx", "txt", "uxml", "yaml", "yml",
     ]
     .into_iter()
     .collect();
-    walk_scan(root, root, db_path, &skip_dirs, &suffixes, &mut files)?;
+    walk_scan(
+        root, root, db_path, &skip_dirs, &suffixes, filter, &mut files,
+    )?;
     Ok(files)
 }
 
+/// Generated/minified artifacts that must never be scanned or annotated.
+fn skip_file_name(name: &str) -> bool {
+    name == "packages-lock.json"
+        || name == "package-lock.json"
+        || name.ends_with(".min.js")
+        || name.ends_with(".d.ts")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk_scan(
     root: &Path,
     dir: &Path,
     db_path: &Path,
     skip_dirs: &HashSet<&str>,
     suffixes: &HashSet<&str>,
+    filter: &ScanFilter,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let entries = match fs::read_dir(dir) {
@@ -573,17 +1198,22 @@ fn walk_scan(
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
         if file_type.is_dir() {
             let name = entry.file_name();
-            if !skip_dirs.contains(name.to_string_lossy().as_ref()) {
-                walk_scan(root, &path, db_path, skip_dirs, suffixes, files)?;
+            if !skip_dirs.contains(name.to_string_lossy().as_ref()) && filter.allows_dir(&rel) {
+                walk_scan(root, &path, db_path, skip_dirs, suffixes, filter, files)?;
             }
             continue;
         }
         if !file_type.is_file() || absolute_path(&path)? == db_path {
             continue;
         }
-        if path.file_name() == Some(OsStr::new("packages-lock.json")) {
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(skip_file_name)
+        {
             continue;
         }
         if path
@@ -591,6 +1221,7 @@ fn walk_scan(
             .and_then(OsStr::to_str)
             .is_some_and(|extension| suffixes.contains(extension))
             && path.starts_with(root)
+            && filter.allows_file(&rel)
         {
             files.push(path);
         }
@@ -602,10 +1233,11 @@ fn expand_markdown_links(
     root: &Path,
     pointers: &HashMap<String, Pointer>,
     write: bool,
+    filter: &ScanFilter,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut changed = Vec::new();
     let mut errors = Vec::new();
-    for path in scan_files(root, &root.join("__no_db__"))? {
+    for path in scan_files(root, &root.join("__no_db__"), filter)? {
         if path.extension() != Some(OsStr::new("md")) {
             continue;
         }
@@ -944,6 +1576,8 @@ mod tests {
         );
     }
 
+    // MUST match repo-lock's glyph.rs golden test (golden_matches_doc_pointers_fixture) —
+    // these constants are a cross-crate pact guarding drift between the duplicated encoders.
     #[test]
     fn generated_token_matches_unity_fixture() {
         let uuid = Uuid::new_v5(
@@ -952,6 +1586,15 @@ mod tests {
         );
         assert_eq!(uuid.to_string(), "5c692577-ad0c-51f1-992c-759b5e5fffb5");
         assert_eq!(unicode4_encode_uuid(uuid), "𓆴𓎲𓋝𓁅");
+        // Base-1072 residue the four glyphs display (u128 big-endian mod 1072^4);
+        // codepoints U+131B4 U+133B2 U+132DD U+13045.
+        let residue = u128::from_be_bytes(*uuid.as_bytes()) % TOKEN_SIZE.pow(TOKEN_LENGTH as u32);
+        assert_eq!(residue, 538_207_322_037);
+        let codepoints: Vec<String> = unicode4_encode_uuid(uuid)
+            .chars()
+            .map(|c| format!("U+{:X}", c as u32))
+            .collect();
+        assert_eq!(codepoints.join(" "), "U+131B4 U+133B2 U+132DD U+13045");
     }
 
     #[test]
@@ -971,8 +1614,12 @@ mod tests {
         )
         .unwrap();
 
-        let (pointers, errors) =
-            collect_pointers(&root, &root.join("docs/doc-pointer-db.json")).unwrap();
+        let (pointers, errors) = collect_pointers(
+            &root,
+            &root.join("docs/doc-pointer-db.json"),
+            &ScanFilter::default(),
+        )
+        .unwrap();
         assert!(errors.is_empty());
         assert!(pointers.contains_key("REAL"));
         assert!(!pointers.contains_key("NOIS"));
@@ -996,10 +1643,15 @@ mod tests {
         )
         .unwrap();
 
-        let (pointers, errors) =
-            collect_pointers(&root, &root.join("docs/doc-pointer-db.json")).unwrap();
+        let (pointers, errors) = collect_pointers(
+            &root,
+            &root.join("docs/doc-pointer-db.json"),
+            &ScanFilter::default(),
+        )
+        .unwrap();
         assert!(errors.is_empty());
-        let (changed, link_errors) = expand_markdown_links(&root, &pointers, true).unwrap();
+        let (changed, link_errors) =
+            expand_markdown_links(&root, &pointers, true, &ScanFilter::default()).unwrap();
         assert!(link_errors.is_empty());
         assert_eq!(changed, vec!["docs/ref.md".to_string()]);
 
@@ -1008,5 +1660,286 @@ mod tests {
         assert!(rewritten.contains("[ignored](deeplink:ABCD)"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detects_rust_public_functions_only() {
+        assert_eq!(
+            detect_public_decl(Lang::Rust, "pub fn alpha() {"),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Rust, "pub async fn beta(x: u8) -> u8 {"),
+            Some("beta".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Rust, "pub unsafe extern \"C\" fn gamma() {"),
+            Some("gamma".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Rust, "pub(crate) fn hidden() {"),
+            None
+        );
+        assert_eq!(detect_public_decl(Lang::Rust, "fn private() {"), None);
+        assert_eq!(detect_public_decl(Lang::Rust, "pub struct Thing {"), None);
+        assert_eq!(
+            detect_public_decl(Lang::Rust, "let s = \"pub fn fake\";"),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_elixir_public_defs_only() {
+        assert_eq!(
+            detect_public_decl(Lang::Elixir, "def fetch(id) do"),
+            Some("fetch".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Elixir, "def valid?(x), do: true"),
+            Some("valid?".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Elixir, "defmacro is_ok(x) do"),
+            Some("is_ok".to_string())
+        );
+        assert_eq!(detect_public_decl(Lang::Elixir, "defp helper(x) do"), None);
+        assert_eq!(detect_public_decl(Lang::Elixir, "defmodule Foo do"), None);
+        assert_eq!(detect_public_decl(Lang::Elixir, "defmacrop m(x) do"), None);
+        assert_eq!(
+            detect_public_decl(Lang::Elixir, "def unquote(name)(x) do"),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_js_exports_only() {
+        assert_eq!(
+            detect_public_decl(Lang::Js, "export function run() {"),
+            Some("run".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Js, "export default async function boot() {"),
+            Some("boot".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Js, "export const handler = async (req) => {"),
+            Some("handler".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(
+                Lang::Js,
+                "export const fn2: (x: number) => void = (x) => {}"
+            ),
+            Some("fn2".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Js, "exports.helper = function () {"),
+            Some("helper".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Js, "module.exports.util = () => {}"),
+            Some("util".to_string())
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Js, "export const LIMIT = 5;"),
+            None
+        );
+        assert_eq!(
+            detect_public_decl(Lang::Js, "export default function () {"),
+            None
+        );
+        assert_eq!(detect_public_decl(Lang::Js, "module.exports = {"), None);
+        assert_eq!(
+            detect_public_decl(Lang::Js, "const local = () => {};"),
+            None
+        );
+    }
+
+    #[test]
+    fn marker_in_block_above_suppresses_annotation() {
+        let lines: Vec<&str> = vec![
+            "/// ⟦ABCD⟧ alpha :: existing marker",
+            "/// docs continue",
+            "pub fn alpha() {}",
+        ];
+        assert!(block_above_has_marker(Lang::Rust, &lines, 2));
+
+        let lines: Vec<&str> = vec![
+            "# ⟦ABCD⟧ fetch :: existing marker",
+            "@doc \"\"\"",
+            "Fetch a thing.",
+            "\"\"\"",
+            "def fetch(id) do",
+        ];
+        assert!(block_above_has_marker(Lang::Elixir, &lines, 4));
+
+        let lines: Vec<&str> = vec!["pub fn bare() {}"];
+        assert!(!block_above_has_marker(Lang::Rust, &lines, 0));
+
+        let lines: Vec<&str> = vec!["let x = 1;", "", "// ⟦ABCD⟧ far away", "pub fn far() {}"];
+        assert!(block_above_has_marker(Lang::Rust, &lines, 3));
+        let lines: Vec<&str> = vec!["// ⟦ABCD⟧ other", "let x = 1;", "pub fn near() {}"];
+        assert!(!block_above_has_marker(Lang::Rust, &lines, 2));
+    }
+
+    #[test]
+    fn derives_descriptions_from_doc_blocks() {
+        let lines: Vec<&str> = vec![
+            "/// Fetches the widget. Retries twice.",
+            "pub fn fetch() {}",
+        ];
+        assert_eq!(
+            derive_description(Lang::Rust, &lines, 1),
+            Some("Fetches the widget.".to_string())
+        );
+        let lines: Vec<&str> = vec![
+            "@doc \"\"\"",
+            "Loads config :: from disk.",
+            "\"\"\"",
+            "def load do",
+        ];
+        assert_eq!(
+            derive_description(Lang::Elixir, &lines, 3),
+            Some("Loads config : from disk.".to_string())
+        );
+        let lines: Vec<&str> = vec!["pub fn undocumented() {}"];
+        assert_eq!(derive_description(Lang::Rust, &lines, 0), None);
+    }
+
+    #[test]
+    fn annotate_inserts_markers_and_is_idempotent() {
+        let root = env::temp_dir().join(format!("doc-pointers-test-{}", Uuid::new_v4()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "/// Adds numbers.\npub fn add(a: u8, b: u8) -> u8 {\n    a + b\n}\n\nimpl Widget {\n    pub fn new() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/app.ex"),
+            "defmodule App do\n  def run(x) do\n    x\n  end\n\n  def run(x, y) do\n    {x, y}\n  end\n\n  defp hidden, do: :ok\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/index.js"),
+            "export function main() {}\nconst secret = () => {};\n",
+        )
+        .unwrap();
+
+        let args: Vec<String> = vec![
+            "--root".into(),
+            root.to_string_lossy().into_owned(),
+            "--write".into(),
+        ];
+        annotate_command(&args).unwrap();
+
+        let rust = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(rust.contains("// ⟦"));
+        assert!(rust.contains(" add :: Adds numbers."));
+        assert!(rust.contains(" new :: auto-generated pointer for public function new"));
+        // Inserted method marker keeps the declaration's indentation.
+        assert!(rust.contains("\n    // ⟦"));
+
+        let elixir = fs::read_to_string(root.join("src/app.ex")).unwrap();
+        assert_eq!(
+            elixir.matches("# ⟦").count(),
+            1,
+            "one marker per function name across clauses/arities"
+        );
+        assert!(!elixir.contains("hidden ::"));
+
+        let js = fs::read_to_string(root.join("src/index.js")).unwrap();
+        assert!(js.contains("// ⟦"));
+        assert!(!js.contains("secret ::"));
+
+        // DB written by the closing build.
+        let db = fs::read_to_string(root.join("docs/doc-pointer-db.json")).unwrap();
+        assert!(db.contains("src/lib.rs"));
+
+        // Idempotency: second run changes nothing.
+        annotate_command(&args).unwrap();
+        assert_eq!(rust, fs::read_to_string(root.join("src/lib.rs")).unwrap());
+        assert_eq!(elixir, fs::read_to_string(root.join("src/app.ex")).unwrap());
+        assert_eq!(js, fs::read_to_string(root.join("src/index.js")).unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn annotate_is_deterministic_across_tree_copies() {
+        let make_tree = || {
+            let root = env::temp_dir().join(format!("doc-pointers-test-{}", Uuid::new_v4()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/lib.rs"), "pub fn solo() {}\n").unwrap();
+            root
+        };
+        let a = make_tree();
+        let b = make_tree();
+        for root in [&a, &b] {
+            let args: Vec<String> = vec![
+                "--root".into(),
+                root.to_string_lossy().into_owned(),
+                "--write".into(),
+            ];
+            annotate_command(&args).unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(a.join("src/lib.rs")).unwrap(),
+            fs::read_to_string(b.join("src/lib.rs")).unwrap(),
+            "same tree must mint identical codes"
+        );
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn annotate_preserves_missing_trailing_newline_layout() {
+        let root = env::temp_dir().join(format!("doc-pointers-test-{}", Uuid::new_v4()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/tail.rs"), "pub fn tail() {}").unwrap(); // no trailing \n
+        let args: Vec<String> = vec![
+            "--root".into(),
+            root.to_string_lossy().into_owned(),
+            "--write".into(),
+        ];
+        annotate_command(&args).unwrap();
+        let text = fs::read_to_string(root.join("src/tail.rs")).unwrap();
+        assert!(
+            text.ends_with("pub fn tail() {}"),
+            "no trailing newline added"
+        );
+        assert!(text.starts_with("// ⟦"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_filter_scopes_dirs_and_files() {
+        let filter = ScanFilter {
+            include: vec![PathBuf::from("utilities"), PathBuf::from("libs")],
+            exclude: vec![PathBuf::from("utilities/vendored")],
+        };
+        assert!(filter.allows_dir(Path::new("utilities")));
+        assert!(filter.allows_dir(Path::new("utilities/shell")));
+        assert!(!filter.allows_dir(Path::new("utilities/vendored")));
+        assert!(!filter.allows_dir(Path::new("projects")));
+        assert!(filter.allows_file(Path::new("libs/core/lib/helpers.ex")));
+        assert!(!filter.allows_file(Path::new("utilities/vendored/x.js")));
+        assert!(!filter.allows_file(Path::new("README.md")));
+        let open = ScanFilter::default();
+        assert!(open.allows_dir(Path::new("anything")));
+        assert!(open.allows_file(Path::new("any/file.rs")));
+    }
+
+    #[test]
+    fn generated_and_minified_files_are_skipped() {
+        assert!(skip_file_name("bundle.min.js"));
+        assert!(skip_file_name("types.d.ts"));
+        assert!(skip_file_name("next-env.d.ts"));
+        assert!(skip_file_name("package-lock.json"));
+        assert!(!skip_file_name("main.js"));
+        assert!(!skip_file_name("lib.rs"));
     }
 }
