@@ -10,10 +10,25 @@ use uuid::Uuid;
 
 const DEFAULT_DB_PATH: &str = "docs/doc-pointer-db.json";
 const DOC_POINTER_NAMESPACE: Uuid = uuid::uuid!("64e9408c-37a7-5f92-8893-f149cbde01c0");
-const TOKEN_START: u32 = 0x13000;
-const TOKEN_END: u32 = 0x1342F;
-const TOKEN_SIZE: u128 = (TOKEN_END - TOKEN_START + 1) as u128;
+const TOKEN_RANGES: [(u32, u32); 4] = [
+    (0x10980, 0x1099F), // Meroitic Hieroglyphs
+    (0x13000, 0x1342F), // Egyptian Hieroglyphs
+    (0x13460, 0x143FF), // Egyptian Hieroglyphs Extended-A; skips U+13430..U+1345F controls
+    (0x14400, 0x1467F), // Anatolian Hieroglyphs
+];
+const TOKEN_SIZE: u128 = token_alphabet_size();
 const TOKEN_LENGTH: usize = 4;
+
+const fn token_alphabet_size() -> u128 {
+    let mut total = 0u128;
+    let mut index = 0usize;
+    while index < TOKEN_RANGES.len() {
+        let (start, end) = TOKEN_RANGES[index];
+        total += (end - start + 1) as u128;
+        index += 1;
+    }
+    total
+}
 
 #[derive(Debug, Clone)]
 struct Pointer {
@@ -945,17 +960,17 @@ fn print_help() {
 doc-pointers — durable, code-stable cross-document pointers
 
 WHAT
-  Doc pointers are 4-character tokens (drawn from the Unicode U+13000..U+1342F
-  Egyptian Hieroglyphs block) placed as inline declarations inside source files,
-  comments, and Markdown. A declaration looks like:
+  Doc pointers are 4-character tokens drawn from curated printable Unicode sign
+  blocks: Meroitic Hieroglyphs, Egyptian Hieroglyphs, Egyptian Hieroglyphs
+  Extended-A, and Anatolian Hieroglyphs. A declaration looks like:
 
-      > ⟦𓆴𓎲𓋝𓁅⟧ Pointer name :: Human readable description.
+      > ⟦𓳔𔐮𔘟𔄵⟧ Pointer name :: Human readable description.
 
   Because the token is a fixed Unicode glyph sequence and not a path or line
   number, it survives renames, refactors, and file moves. Other documents then
   reference it with a `deeplink:` Markdown link, e.g.
 
-      [see routing](deeplink:⟦𓆴𓎲𓋝𓁅⟧)
+      [see routing](deeplink:⟦𓳔𔐮𔘟𔄵⟧)
 
   and `doc-pointers` rewrites that link into a concrete `path:line?code=⟦…⟧` target.
 
@@ -976,9 +991,10 @@ WHY
   Ordinary file:line and URL links rot the instant code moves. Branch names and
   permalinks are worse. A doc pointer decouples the *identity* of an anchor
   (the token) from its *current location* (which `build` resolves on demand), so
-  docs stay accurate without manual re-pointing. The Hieroglyph block is chosen
-  so tokens are visually distinct and never appear in real source, and the
-  UUIDv5 derivation makes them reproducible and collision-free across machines.
+  docs stay accurate without manual re-pointing. The sign blocks are chosen so
+  tokens are visually distinct and unlikely to appear in real source. UUIDv5
+  derivation makes them reproducible across machines, and generation checks the
+  current database for display-token collisions.
 
 USAGE
   doc-pointers                       print this help
@@ -1465,9 +1481,20 @@ fn unicode4_encode_uuid(value: Uuid) -> String {
     for _ in 0..TOKEN_LENGTH {
         let index = (number % TOKEN_SIZE) as u32;
         number /= TOKEN_SIZE;
-        chars.push(char::from_u32(TOKEN_START + index).expect("valid token code point"));
+        chars.push(token_char_from_index(index));
     }
     chars.into_iter().rev().collect()
+}
+
+fn token_char_from_index(mut index: u32) -> char {
+    for &(start, end) in TOKEN_RANGES.iter() {
+        let range_size = end - start + 1;
+        if index < range_size {
+            return char::from_u32(start + index).expect("valid token code point");
+        }
+        index -= range_size;
+    }
+    panic!("token alphabet index out of range");
 }
 
 fn format_pointer(
@@ -1623,16 +1650,16 @@ mod tests {
             "doc-pointers:TestPointer".as_bytes(),
         );
         assert_eq!(uuid.to_string(), "5c692577-ad0c-51f1-992c-759b5e5fffb5");
-        assert_eq!(unicode4_encode_uuid(uuid), "𓆴𓎲𓋝𓁅");
-        // Base-1072 residue the four glyphs display (u128 big-endian mod 1072^4);
-        // codepoints U+131B4 U+133B2 U+132DD U+13045.
+        assert_eq!(unicode4_encode_uuid(uuid), "𓳔𔐮𔘟𔄵");
+        // Sign-alphabet residue the four glyphs display (u128 big-endian mod 5744^4);
+        // codepoints U+13CD4 U+1442E U+1461F U+14135.
         let residue = u128::from_be_bytes(*uuid.as_bytes()) % TOKEN_SIZE.pow(TOKEN_LENGTH as u32);
-        assert_eq!(residue, 538_207_322_037);
+        assert_eq!(residue, 619_504_546_873_269);
         let codepoints: Vec<String> = unicode4_encode_uuid(uuid)
             .chars()
             .map(|c| format!("U+{:X}", c as u32))
             .collect();
-        assert_eq!(codepoints.join(" "), "U+131B4 U+133B2 U+132DD U+13045");
+        assert_eq!(codepoints.join(" "), "U+13CD4 U+1442E U+1461F U+14135");
     }
 
     #[test]
