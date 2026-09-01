@@ -118,9 +118,15 @@ doc-pointers annotate  [--root R] [--db P] [--include P]... [--exclude P]...
                        [--lang exs] [--write]
 doc-pointers uuid5     [NAME] [--root R] [--db P] [--namespace N] [--salt S]
                        [--format marker|code|declaration|deeplink]
-                       [--description TEXT] [--no-clipboard]
+                       [--description TEXT] [--no-clipboard]     (alias: new)
 doc-pointers hook      [--root R] [--db P]
+doc-pointers help | -h | --help
 ```
+
+- No arguments at all → help, exit 0
+- `-h`/`--help`/`help` → help
+- A leading legacy build flag (`--root`/`--db`/`--write`/`--check`/`--install-hook`) is treated as `build` (legacy scripts keep working)
+- Unknown subcommand → error, exit 1
 
 - `--root` defaults to `.`; `--db` defaults to `docs/doc-pointer-db.json` (root-relative)
 - Legacy top-level `--write` / `--check` / `--install-hook` dispatch to `build` / `hook`

@@ -29,6 +29,7 @@ misc-git-utils/
 │       └── doc-pointers-ci-hook.md
 ├── target/                     # Cargo build output (gitignored — not documented)
 ├── .gitignore                  # Ignores target/, .env, .envrc.local, editor swap files
+├── CLAUDE.md                   # Claude Code guidance (commands, monorepo rules)
 ├── Cargo.toml                  # Rust package `misc-git-utils` (edition 2021; dep: uuid v4/v5)
 ├── Cargo.lock                  # Locked Rust dependency versions (committed)
 ├── Makefile                    # test (cargo fmt/build + bash -n bin/*), install → ~/.local/bin

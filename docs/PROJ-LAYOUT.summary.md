@@ -12,6 +12,7 @@ misc-git-utils/
 ├── docs/                       # PROJ-* docs + summaries + howto/ topic guides
 │   └── howto/                  #   doc-pointers basics / annotate / CI hook
 ├── .gitignore                  # target/, env files, swap files
+├── CLAUDE.md                   # Claude Code guidance
 ├── Cargo.toml                  # Rust package (dep: uuid)
 ├── Cargo.lock                  # locked deps
 ├── Makefile                    # test / install → ~/.local/bin
