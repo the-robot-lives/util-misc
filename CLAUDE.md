@@ -5,6 +5,10 @@ Misc git helpers used in trl-infra submodule sweeps (gitlink pinning, branch hou
 
 Part of the Noizu utilities fleet (trl-infra monorepo, `Portfolio/Utilities/source/*`). Installed to `~/.local/bin` via monorepo root `make install-utilities`; some packages are also dual-path registered at repo-root `utilities/<group>/` (same remote/SHA).
 
+- Submodules sit on **`develop`** — keep your checkout on `develop`.
+- All PRs target **`develop`** (feature/bug/task branches fork from `develop`).
+- **`main` is CI/CD-only**: CI/CD automation performs all merges into `main` (release path). Never merge to or push `main` by hand.
+
 ## Commands
 
 ```bash
