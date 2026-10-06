@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# doc-pointers-docmost-sync — mirror docs/doc-pointer-db.json entries to Docmost pages.
+#
+# One child page per pointer under a parent page in a Docmost space; upsert by
+# title. Records {code: {space, pageId}} in docs/doc-pointer-docmost.json.
+#
+# Env:
+#   DOCMOST_API_URL      base URL (default https://docmost.noizu.com)
+#   DOCMOST_API_KEY      bearer token (required)
+#   DOCMOST_MCP_WRITES   must be "1" to allow any write (mirrors docmost-mcp gate)
+#
+# Usage:
+#   doc-pointers-docmost-sync [--root ROOT] [--db DB] [--sidecar DB]
+#                             [--space NAME] [--parent TITLE] [--dry-run]
+set -euo pipefail
+exec python3 - "$@" <<'PY'
+import argparse, json, os, sys, urllib.request, urllib.error, urllib.parse
+
+def api(method, path, body=None, params=None):
+    base = os.environ.get("DOCMOST_API_URL", "https://docmost.noizu.com").rstrip("/")
+    key = os.environ.get("DOCMOST_API_KEY")
+    if not key:
+        sys.exit("ERROR: DOCMOST_API_KEY is not set")
+    url = f"{base}/api/{path.lstrip('/')}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "authorization": f"Bearer {key}",
+        "content-type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        sys.exit(f"ERROR: {method} {url} -> {e.code}: {e.read().decode(errors='replace')[:300]}")
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--root", default=".")
+    p.add_argument("--db", default="docs/doc-pointer-db.json")
+    p.add_argument("--sidecar", default="docs/doc-pointer-docmost.json")
+    p.add_argument("--space", required=True, help="docmost space slug or name")
+    p.add_argument("--parent", default="doc-pointers", help="parent page title under the space root")
+    p.add_argument("--dry-run", action="store_true")
+    a = p.parse_args()
+
+    db_path = os.path.join(a.root, a.db)
+    try:
+        with open(db_path) as f:
+            pointers = json.load(f)
+    except OSError as e:
+        sys.exit(f"ERROR: cannot read {db_path}: {e}")
+    if not isinstance(pointers, dict) or not pointers:
+        sys.exit(f"ERROR: {db_path} has no pointer entries")
+
+    write = os.environ.get("DOCMOST_MCP_WRITES") == "1" and not a.dry_run
+    if not write:
+        mode = "DRY-RUN" if a.dry_run else "READ-ONLY (set DOCMOST_MCP_WRITES=1 to apply)"
+        print(f"{mode}: would sync {len(pointers)} pointer(s) to space '{a.space}' under '{a.parent}'")
+        for code, e in sorted(pointers.items()):
+            print(f"  ⟦{code}⟧ {e.get('name','')} :: {e.get('path','')}:{e.get('line','')}")
+        return
+
+    spaces = []
+    cursor = None
+    while True:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        page = api("GET", "/spaces", params=params)
+        spaces.extend(page.get("data", []) if isinstance(page, dict) else page)
+        cursor = page.get("meta", {}).get("nextCursor") if isinstance(page, dict) else None
+        if not cursor:
+            break
+    space = next((s for s in spaces if a.space in (s.get("slug"), s.get("name"))
+                  or (s.get("name") or "").lower() == a.space.lower()), None)
+    if not space:
+        known = ", ".join(sorted((s.get("slug") or s.get("name") or "?") for s in spaces))
+        sys.exit(f"ERROR: space '{a.space}' not found; known: {known}")
+    sid = space["id"]
+
+    def find_in(pages, title):
+        return next((pg for pg in pages if pg.get("title") == title), None)
+
+    def list_children(page_id):
+        out, cursor = [], None
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            res = api("GET", f"/pages/{page_id}/children", params=params)
+            out.extend(res.get("data", []) if isinstance(res, dict) else res)
+            cursor = res.get("meta", {}).get("nextCursor") if isinstance(res, dict) else None
+            if not cursor:
+                return out
+
+    # parent pages live at the space root
+    res = api("GET", f"/spaces/{sid}/pages", params={"limit": 100})
+    roots = res.get("data", []) if isinstance(res, dict) else res
+    parent = find_in(roots, a.parent)
+    if not parent:
+        parent = api("POST", f"/spaces/{sid}/pages", {"title": a.parent})
+        print(f"created parent page '{a.parent}' ({parent['id']})")
+    else:
+        print(f"parent page '{a.parent}' found ({parent['id']})")
+
+    existing = {pg.get("title"): pg for pg in list_children(parent["id"])}
+    sidecar_path = os.path.join(a.root, a.sidecar)
+    try:
+        with open(sidecar_path) as f:
+            sidecar = json.load(f)
+    except (OSError, ValueError):
+        sidecar = {}
+
+    created = updated = unchanged = 0
+    for code, e in sorted(pointers.items()):
+        title = f"{e.get('name') or 'pointer'} ⟦{code}⟧"
+        content = (f"# {title}\n\n"
+                   f"- **Pointer:** ⟦{code}⟧\n"
+                   f"- **Location:** `{e.get('path','')}:{e.get('line','')}`\n\n"
+                   f"{(e.get('description') or '').strip()}\n")
+        hit = existing.get(title)
+        if hit:
+            current = api("GET", f"/pages/{hit['id']}").get("content") or ""
+            if current.strip() == content.strip():
+                unchanged += 1
+            else:
+                api("PUT", f"/pages/{hit['id']}/content",
+                    {"content": content, "operation": "replace"})
+                updated += 1
+            pid = hit["id"]
+        else:
+            made = api("POST", f"/spaces/{sid}/pages",
+                       {"title": title, "parentId": parent["id"], "content": content})
+            pid = made["id"]
+            created += 1
+        sidecar[code] = {"space": space.get("slug") or space.get("name"), "pageId": pid}
+
+    with open(sidecar_path, "w") as f:
+        json.dump(sidecar, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"docmost sync complete: {created} created, {updated} updated, "
+          f"{unchanged} unchanged; sidecar -> {a.sidecar}")
+
+main()
+PY
