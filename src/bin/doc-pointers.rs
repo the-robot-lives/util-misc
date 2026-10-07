@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use uuid::Uuid;
 
 const DEFAULT_DB_PATH: &str = "docs/doc-pointer-db.json";
+#[path = "../docptr_ranges.rs"] mod docptr_ranges;
+use docptr_ranges::{build_index, collect_prefixed, get_chain, impact, parse_diff, update_pointer};
 const DOC_POINTER_NAMESPACE: Uuid = uuid::uuid!("64e9408c-37a7-5f92-8893-f149cbde01c0");
 const TOKEN_RANGES: [(u32, u32); 4] = [
     (0x10980, 0x1099F), // Meroitic Hieroglyphs
@@ -45,6 +47,8 @@ struct ScanOptions {
     db: String,
     write: bool,
     check: bool,
+    strict: bool,
+    layers: bool,
     install_hook: bool,
     filter: ScanFilter,
 }
@@ -126,8 +130,12 @@ fn main() {
     // is treated as the build command so existing scripts keep working.
     let result = match args.first().map(String::as_str) {
         Some("build") => scan_command(&args[1..]),
+        Some("scan") => scan_command(&args[1..]),
         Some("annotate") => annotate_command(&args[1..]),
         Some("uuid5" | "new") => uuid5_command(&args[1..]),
+        Some("get") => get_command(&args[1..]),
+        Some("update") => update_command(&args[1..]),
+        Some("impact") => impact_command(&args[1..]),
         Some("hook") => install_command(&args[1..], true),
         Some("-h" | "--help" | "help") => {
             print_help();
@@ -184,6 +192,23 @@ fn scan_command(args: &[String]) -> Result<(), String> {
     let (changed_links, link_errors) =
         expand_markdown_links(&root, &pointers, options.write, &options.filter)?;
     errors.extend(link_errors);
+
+    if options.strict {
+        let files = scan_files(&root, &db_path, &options.filter)?;
+        let (_, strict_errors) = collect_prefixed(&root, &files, true)?;
+        for error in &strict_errors {
+            eprintln!("ERROR (strict): {error}");
+        }
+        if !strict_errors.is_empty() {
+            std::process::exit(1);
+        }
+    }
+
+    if options.layers {
+        let files = scan_files(&root, &db_path, &options.filter)?;
+        let written = build_index(&root, &files)?.len();
+        println!("wrote layered index for {written} pointer(s) under .meta/");
+    }
 
     let mut db_changed = false;
     if options.write {
@@ -762,6 +787,139 @@ fn annotate_command(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn get_command(args: &[String]) -> Result<(), String> {
+    let mut root = PathBuf::from(".");
+    let mut key: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                println!("usage: doc-pointers get [--root ROOT] <TOKEN|UUID>\n\nResolve a pointer in the layered index and print the parents chain:\nlogic ← function ← module ← file ← component.");
+                std::process::exit(0);
+            }
+            "--root" => {
+                index += 1;
+                root = PathBuf::from(expect_value(args, index, "--root")?);
+            }
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            value => {
+                if key.is_some() {
+                    return Err(format!("unexpected argument: {value}"));
+                }
+                key = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let key = key.ok_or_else(|| "get requires a TOKEN or UUID".to_string())?;
+    let root = absolute_path(&root)?;
+    let chain = get_chain(&root, &key)?;
+    for entry in chain {
+        if entry.kind == "component" {
+            println!("component: {}", entry.name);
+        } else {
+            println!(
+                "{} ⟦{}⟧ {} :: {}:{}-{} component={}",
+                entry.kind, entry.token, entry.name, entry.file, entry.line_start, entry.line_end, entry.component
+            );
+        }
+    }
+    Ok(())
+}
+
+fn update_command(args: &[String]) -> Result<(), String> {
+    let mut root = PathBuf::from(".");
+    let mut key: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                println!("usage: doc-pointers update [--root ROOT] <TOKEN|UUID>\n\nRecompute path, range, and checksum for one pointer and rewrite .meta/pointers.yaml.");
+                std::process::exit(0);
+            }
+            "--root" => {
+                index += 1;
+                root = PathBuf::from(expect_value(args, index, "--root")?);
+            }
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            value => {
+                if key.is_some() {
+                    return Err(format!("unexpected argument: {value}"));
+                }
+                key = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let key = key.ok_or_else(|| "update requires a TOKEN or UUID".to_string())?;
+    let root = absolute_path(&root)?;
+    let entry = update_pointer(&root, &key)?;
+    println!(
+        "updated ⟦{}⟧ {}:{}-{} (checksum refreshed)",
+        entry.token, entry.file, entry.line_start, entry.line_end
+    );
+    Ok(())
+}
+
+fn impact_command(args: &[String]) -> Result<(), String> {
+    let mut root = PathBuf::from(".");
+    let mut diff_path: Option<String> = None;
+    let mut read_stdin = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                println!("usage: doc-pointers impact [--root ROOT] (<DIFF-FILE> | -)\n\nGiven a unified diff, report every scoped pointer whose range overlaps a changed hunk, with its component mapping.");
+                std::process::exit(0);
+            }
+            "--root" => {
+                index += 1;
+                root = PathBuf::from(expect_value(args, index, "--root")?);
+            }
+            "-" => read_stdin = true,
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            value => {
+                if diff_path.is_some() {
+                    return Err(format!("unexpected argument: {value}"));
+                }
+                diff_path = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let diff = if read_stdin {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("could not read stdin: {e}"))?;
+        buf
+    } else {
+        let path = diff_path.ok_or_else(|| "impact requires a diff file path or -".to_string())?;
+        fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))?
+    };
+    let hunks = parse_diff(&diff);
+    println!(
+        "diff: {} file(s), {} hunk(s)",
+        hunks.len(),
+        hunks.iter().map(|f| f.hunks.len()).sum::<usize>()
+    );
+    let root = absolute_path(&root)?;
+    let hits = impact(&root, &diff, &docptr_ranges::load_components(&root))?;
+    if hits.is_empty() {
+        println!("no pointer ranges impacted");
+        return Ok(());
+    }
+    for hit in &hits {
+        println!(
+            "IMPACT {} ⟦{}⟧ {} {}:{}-{} component={}",
+            hit.kind, hit.code, hit.name, hit.file, hit.line_start, hit.line_end, hit.component
+        );
+    }
+    println!("{} pointer range(s) impacted", hits.len());
+    Ok(())
+}
+
 fn parse_annotate_options(args: &[String]) -> Result<AnnotateOptions, String> {
     let mut options = AnnotateOptions {
         root: PathBuf::from("."),
@@ -833,6 +991,8 @@ fn parse_scan_options(args: &[String]) -> Result<ScanOptions, String> {
         db: DEFAULT_DB_PATH.to_string(),
         write: false,
         check: false,
+        strict: false,
+        layers: false,
         install_hook: false,
         filter: ScanFilter::default(),
     };
@@ -868,6 +1028,8 @@ fn parse_scan_options(args: &[String]) -> Result<ScanOptions, String> {
             }
             "--write" => options.write = true,
             "--check" => options.check = true,
+            "--strict" => options.strict = true,
+            "--layers" => options.layers = true,
             "--install-hook" => options.install_hook = true,
             value => return Err(format!("unknown option: {value}")),
         }
@@ -1005,6 +1167,9 @@ USAGE
   doc-pointers annotate --write      insert markers + record db in one pass
   doc-pointers hook                  install a pre-commit hook that runs --check
   doc-pointers uuid5 [NAME]          mint a new 4-glyph token, copied to clipboard
+  doc-pointers get <TOKEN|UUID>      resolve pointer + parents chain (logic←fn←module←file←component)
+  doc-pointers update <TOKEN|UUID>   recompute path/range/checksum for one pointer
+  doc-pointers impact <DIFF|->       report pointer ranges overlapped by a unified diff
   doc-pointers help                  print this help
 
 SUB-COMMAND HELP
