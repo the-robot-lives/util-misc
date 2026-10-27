@@ -1,5 +1,8 @@
 # Changelog — utilities/shell/misc-git-utils
 
+## 2026-10-28
+- docs: add AGENT-README.md (agent orientation)
+
 ## [Unreleased]
 - Moved the `doc-pointers` Rust CLI, its install target, and CLI guides to [the doc-pointers repository](https://github.com/the-robot-lives/doc-pointers), where it shares the MCP service's YAML stores. This package now installs only four Git shell helpers.
 - Added PROJ-ARCH.md / PROJ-ARCH.summary.md / PROJ-LAYOUT.md / PROJ-LAYOUT.summary.md under `docs/` (self-documentation of this package's own architecture and layout)
