@@ -1,4 +1,6 @@
 # FAQ — misc-git-utils
+<!-- 〚📁:c84de756-ff9b-5b73-8830-fd77a5dbc3ce〛 FAQ :: Common gotchas for the four commands. -->
+
 
 ## Does `gcap` stage untracked files?
 

@@ -1,0 +1,98 @@
+---
+pointers:
+  06ae3269-0033-598e-90ec-aa8d081062c6:
+    created_at: 2026-10-27T04:37:16.671839Z
+    description: Full repo tree with per-file descriptions.
+    file_path: docs/PROJ-LAYOUT.md
+    function: Project Layout
+    kind: file
+    line: 2
+    locations:
+      - file_path: docs/PROJ-LAYOUT.md
+        line: 2
+    token: 𓚑𓛰𓭢𔋶
+    updated_at: 2026-10-27T04:37:16.671839Z
+  17e3cfbf-1c58-5330-aab3-d321674f463f:
+    created_at: 2026-10-27T04:37:16.671846Z
+    description: Trust boundaries, vulnerability register, residual risk.
+    file_path: docs/THREAT-MODEL.md
+    function: Threat Model
+    kind: file
+    line: 2
+    locations:
+      - file_path: docs/THREAT-MODEL.md
+        line: 2
+    token: 𓬮𓮤𓓵𐦏
+    updated_at: 2026-10-27T04:37:16.671846Z
+  1d11c474-c8df-58c4-a4c3-b74974bdf6d8:
+    created_at: 2026-10-27T04:37:16.671827Z
+    description: Install and run the four commands.
+    file_path: docs/PROJ-HOWTO.md
+    function: Usage Walkthrough
+    kind: file
+    line: 2
+    locations:
+      - file_path: docs/PROJ-HOWTO.md
+        line: 2
+    token: 𓄒𓓻𓿽𓘸
+    updated_at: 2026-10-27T04:37:16.671827Z
+  1da994c3-b887-5063-a7cc-c0fd4e4b5dc7:
+    created_at: 2026-10-27T04:37:16.671836Z
+    description: Branch policy, worktree convention, monorepo rules.
+    file_path: CLAUDE.md
+    function: Agent Instructions
+    kind: file
+    line: 2
+    locations:
+      - file_path: CLAUDE.md
+        line: 2
+    token: 𓇛𓝠𓌘𓕗
+    updated_at: 2026-10-27T04:37:16.671836Z
+  38c869ec-88d8-542b-8e8e-6eb3a56897ad:
+    created_at: 2026-10-27T04:37:16.671812Z
+    description: Four standalone Bash commands, no shared runtime.
+    file_path: docs/PROJ-ARCH.md
+    function: Project Architecture
+    kind: file
+    line: 2
+    locations:
+      - file_path: docs/PROJ-ARCH.md
+        line: 2
+    token: 𓀵𓁺𓎌𓩽
+    updated_at: 2026-10-27T04:37:16.671812Z
+  41252e5d-a399-54cb-b4ae-ae37c1a0d0a5:
+    created_at: 2026-10-27T04:37:16.671842Z
+    description: No persistence layer; scripts write through git only.
+    file_path: docs/PROJ-SCHEMA.md
+    function: Project Schema
+    kind: file
+    line: 2
+    locations:
+      - file_path: docs/PROJ-SCHEMA.md
+        line: 2
+    token: 𓣑𔍶𓔨𔀵
+    updated_at: 2026-10-27T04:37:16.671842Z
+  9ec492de-6ab9-5adb-bfa9-82e2801145ae:
+    created_at: 2026-10-27T04:37:16.671855Z
+    description: 'Entry point: command inventory, install, and usage summary.'
+    file_path: README.md
+    function: misc-git-utils README
+    kind: file
+    line: 2
+    locations:
+      - file_path: README.md
+        line: 2
+    token: 𓸙𓨿𓻢𓻞
+    updated_at: 2026-10-27T04:37:16.671855Z
+  c84de756-ff9b-5b73-8830-fd77a5dbc3ce:
+    created_at: 2026-10-27T04:37:16.671852Z
+    description: Common gotchas for the four commands.
+    file_path: docs/PROJ-FAQ.md
+    function: FAQ
+    kind: file
+    line: 2
+    locations:
+      - file_path: docs/PROJ-FAQ.md
+        line: 2
+    token: 𓮄𓎊𓯓𔊎
+    updated_at: 2026-10-27T04:37:16.671852Z

@@ -1,4 +1,6 @@
 # Threat Model — misc-git-utils
+<!-- 〚📁:17e3cfbf-1c58-5330-aab3-d321674f463f〛 Threat Model :: Trust boundaries, vulnerability register, residual risk. -->
+
 
 ## Overview
 

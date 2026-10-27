@@ -1,4 +1,6 @@
 # Project Layout — misc-git-utils
+<!-- 〚📁:06ae3269-0033-598e-90ec-aa8d081062c6〛 Project Layout :: Full repo tree with per-file descriptions. -->
+
 
 ```text
 misc-git-utils/
