@@ -19,4 +19,6 @@ flowchart LR
 | `submodule-pull` | Fast-forward initialized submodules; skip detached HEADs. |
 | `submodule-diff` | Show staged, unstaged, and untracked changes across nested submodules. |
 
+→ *Components ↔ directories: see [PROJ-LAYOUT.md](PROJ-LAYOUT.md)*
+
 The doc-pointer CLI and MCP service are maintained together in [doc-pointers](https://github.com/the-robot-lives/doc-pointers). This package no longer builds or installs that CLI.

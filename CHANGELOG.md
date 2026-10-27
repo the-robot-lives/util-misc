@@ -6,6 +6,7 @@
 
 ## 2026-10-26
 - docs: correct stale "main is CI/CD-only" deploy note — merging into main triggers CI/CD (user-verified 2026-10-26)
+- docs: doc-sweep 2026-10-26 — full repo tree in PROJ-LAYOUT.md (+ summary), arch↔layout cross-reference in PROJ-ARCH.md, schema data-inventory note in PROJ-SCHEMA.md, new THREAT-MODEL.md (+ summary)
 
 ## [m2-doc-pointers-tool] — 2026-07-09 — tag: `utilities-shell-misc-git-utils/m2-doc-pointers-tool`
 Introduced `doc-pointers`, a Rust rewrite/addition alongside the shell scripts: scans source for doc-pointer tokens, maintains a JSON pointer DB keyed by deterministic UUIDv5s, and can install a git hook. Landed as a single large addition, then refined twice in quick succession.
