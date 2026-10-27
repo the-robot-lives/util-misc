@@ -1,4 +1,6 @@
 # Project Architecture — misc-git-utils
+<!-- 〚📁:38c869ec-88d8-542b-8e8e-6eb3a56897ad〛 Project Architecture :: Four standalone Bash commands, no shared runtime. -->
+
 
 ## Overview
 

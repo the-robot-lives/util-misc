@@ -1,4 +1,6 @@
 # CLAUDE.md — misc-git-utils
+<!-- 〚📁:1da994c3-b887-5063-a7cc-c0fd4e4b5dc7〛 Agent Instructions :: Branch policy, worktree convention, monorepo rules. -->
+
 
 Misc git helpers used in trl-infra submodule sweeps (gitlink pinning, branch housekeeping). See bin/ for the command inventory.
 

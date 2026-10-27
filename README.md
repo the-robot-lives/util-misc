@@ -1,4 +1,6 @@
 # misc-git-utils
+<!-- 〚📁:9ec492de-6ab9-5adb-bfa9-82e2801145ae〛 misc-git-utils README :: Entry point: command inventory, install, and usage summary. -->
+
 
 **Repo:** https://github.com/the-robot-lives/util-misc
 
